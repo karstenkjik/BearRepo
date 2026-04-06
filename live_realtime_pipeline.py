@@ -201,20 +201,14 @@ class InferenceRunner:
         self.model.eval()
 
     def predict_horse_probability(self, window: np.ndarray):
-        print("DEBUG: entering predict_horse_probability")
 
         x = np.expand_dims(window, axis=0).astype(np.float32)
-        print("DEBUG: expanded x shape =", x.shape)
 
         x_tensor = torch.from_numpy(x).to(self.device)
-        print("DEBUG: created tensor")
 
         with torch.no_grad():
-            print("DEBUG: about to run model")
             logits = self.model(x_tensor)
-            print("DEBUG: model ran")
             probs = torch.softmax(logits, dim=1)
-            print("DEBUG: softmax ran")
 
         probs_np = probs[0].cpu().numpy()
         pred_class = int(np.argmax(probs_np))
