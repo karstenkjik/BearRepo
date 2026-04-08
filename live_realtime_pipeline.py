@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from dataclasses import dataclass
-from collections import deque
 import struct
 import socket
 import time
@@ -12,7 +11,6 @@ import numpy as np
 import torch
 
 from model import LidarBinaryCNN2D
-from test_preprocess_frame import preprocess_scan_to_frame
 from test_temporal_buffer import TemporalBuffer
 from test_decision_logic import ProbabilityDecisionFilter
 
@@ -23,9 +21,14 @@ from test_decision_logic import ProbabilityDecisionFilter
 
 UDP_PORT = 2122
 SEQUENCE_LENGTH = 5
-THRESHOLD = 0.30
+
+# Use 0.40 for now. Your replay showed 0.30 was too low for empty windows.
+THRESHOLD = 0.40
 SMOOTH_WINDOW = 5
 PRINT_EVERY = 1
+
+MAX_RANGE_METERS = 40.0
+VALID_DISTANCE_THRESHOLD_M = 0.01
 
 
 # Tokenized msgpack keys used by the SICK datagrams
@@ -52,7 +55,43 @@ class RawScan:
 
 
 # ============================================================
-# UDP parsing helpers (adapted from log_npz.py)
+# Preprocessing
+# ============================================================
+
+def preprocess_scan_to_frame(scan: RawScan, max_range_m: float = MAX_RANGE_METERS) -> np.ndarray:
+    """
+    Converts one raw scan into one processed frame of shape (2, 1, 240).
+
+    Channel 0:
+        normalized range values
+
+    Channel 1:
+        validity mask
+
+    IMPORTANT:
+    This version uses FARFILL:
+        for no-return points (valid == 0), range channel is set to 1.0
+        instead of 0.0
+    """
+    if max_range_m <= 0:
+        raise ValueError("max_range_m must be > 0")
+
+    dist_m = scan.dist_m.astype(np.float32)
+    valid = scan.valid.astype(np.float32)
+
+    range_img = np.clip(dist_m, 0.0, max_range_m) / max_range_m
+
+    # FARFILL: encode no-return as max-range / far away
+    range_img[valid == 0] = 1.0
+
+    x = np.stack([range_img, valid], axis=0).astype(np.float32)  # (2, 240)
+    x = np.expand_dims(x, axis=1)                                # (2, 1, 240)
+
+    return x
+
+
+# ============================================================
+# UDP parsing helpers
 # ============================================================
 
 def getv(d, k_int, k_str=None):
@@ -83,6 +122,7 @@ def decode_sick_array(arr_obj):
         return np.frombuffer(data, dtype="<u2", count=n)
     if elem_sz == 1:
         return np.frombuffer(data, dtype=np.uint8, count=n)
+
     return None
 
 
@@ -117,7 +157,7 @@ def extract_segment_data(msg: dict):
     return None
 
 
-def scan_from_datagram(datagram: bytes) -> list[RawScan]:
+def scans_from_datagram(datagram: bytes) -> list[RawScan]:
     """
     Parse one UDP datagram into zero or more RawScan objects.
     """
@@ -160,8 +200,8 @@ def scan_from_datagram(datagram: bytes) -> list[RawScan]:
         theta_rad = theta.astype(np.float32)
         phi_rad = float(phi_arr[0])
 
-        # Match the live logging script
-        valid = (dist_m > 0.01).astype(np.float32)
+        # Current live validity rule
+        valid = (dist_m > VALID_DISTANCE_THRESHOLD_M).astype(np.float32)
 
         scans_out.append(
             RawScan(
@@ -201,9 +241,11 @@ class InferenceRunner:
         self.model.eval()
 
     def predict_horse_probability(self, window: np.ndarray):
-
-        x = np.expand_dims(window, axis=0).astype(np.float32)
-
+        """
+        window shape: (2, 5, 240)
+        returns: horse_prob, probs_np, pred_class
+        """
+        x = np.expand_dims(window, axis=0).astype(np.float32)  # (1, 2, 5, 240)
         x_tensor = torch.from_numpy(x).to(self.device)
 
         with torch.no_grad():
@@ -236,13 +278,15 @@ def run_live_pipeline(checkpoint_path: str | Path):
     print(f"Sequence length: {SEQUENCE_LENGTH}")
     print(f"Threshold: {THRESHOLD}")
     print(f"Smoothing window: {SMOOTH_WINDOW}")
+    print(f"Max range meters: {MAX_RANGE_METERS}")
+    print("Preprocessing: FARFILL enabled")
     print("Waiting for live scans...\n")
 
     step = 0
 
     while True:
         datagram, addr = sock.recvfrom(65535)
-        scans = scan_from_datagram(datagram)
+        scans = scans_from_datagram(datagram)
 
         for scan in scans:
             step += 1
@@ -277,6 +321,5 @@ def run_live_pipeline(checkpoint_path: str | Path):
 
 
 if __name__ == "__main__":
-    # CHANGE THIS PATH
     checkpoint_path = "/home/pi/BearRepo/bestmodel.pt"
     run_live_pipeline(checkpoint_path)
