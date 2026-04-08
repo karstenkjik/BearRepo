@@ -15,7 +15,7 @@ import numpy as np
 # ============================================================
 
 UDP_PORT = 2122
-SAVE_DIR = Path("/home/pi/BearRepo/live_debug_captures")
+SAVE_DIR = Path("/home/pi/BearRepo/live_debug_captures_outdoor2")
 MAX_SCANS_TO_SAVE = 100
 PRINT_EVERY = 1
 
