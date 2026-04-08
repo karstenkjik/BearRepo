@@ -10,6 +10,7 @@ import torch
 
 from model import LidarBinaryCNN2D
 from test_temporal_buffer import TemporalBuffer
+from test_decision_logic import ProbabilityDecisionFilter
 
 
 # ============================================================
@@ -17,17 +18,20 @@ from test_temporal_buffer import TemporalBuffer
 # ============================================================
 
 SEQUENCE_LENGTH = 5
-MAX_RANGE_METERS = 40.0
 
-# Model-side probability threshold used inside 3-scan phase block
-MODEL_THRESHOLD = 0.50
+# Model-side decision settings
+THRESHOLD = 0.40
+SMOOTH_WINDOW = 5
 
-# Final activation vote settings (over block decisions)
-BLOCK_VOTE_WINDOW = 5
+# Control-side activation logic
+ACTIVATION_WINDOW = 5
 ACTIVATE_IF_AT_LEAST = 3
 DEACTIVATE_IF_AT_MOST = 1
 
+MAX_RANGE_METERS = 40.0
 PRINT_EVERY = 1
+
+# Optional delay between scans to mimic live behavior
 SIMULATED_DELAY_S = 0.0
 
 
@@ -55,6 +59,43 @@ def activate_deterrent():
 
 def deactivate_deterrent():
     print(">>> PLACEHOLDER: DEACTIVATE DETERRENT <<<")
+
+
+# ============================================================
+# Activation controller
+# ============================================================
+
+class ActivationController:
+    def __init__(
+        self,
+        window_size: int = ACTIVATION_WINDOW,
+        activate_if_at_least: int = ACTIVATE_IF_AT_LEAST,
+        deactivate_if_at_most: int = DEACTIVATE_IF_AT_MOST,
+    ):
+        self.window_size = window_size
+        self.activate_if_at_least = activate_if_at_least
+        self.deactivate_if_at_most = deactivate_if_at_most
+        self.history = deque(maxlen=window_size)
+        self.is_active = False
+
+    def update(self, decision: str) -> tuple[str, int]:
+        positive = 1 if decision == "horse_present" else 0
+        self.history.append(positive)
+
+        positive_count = sum(self.history)
+
+        if len(self.history) < self.window_size:
+            return "HOLD", positive_count
+
+        if (not self.is_active) and positive_count >= self.activate_if_at_least:
+            self.is_active = True
+            return "ACTIVATE", positive_count
+
+        if self.is_active and positive_count <= self.deactivate_if_at_most:
+            self.is_active = False
+            return "DEACTIVATE", positive_count
+
+        return "HOLD", positive_count
 
 
 # ============================================================
@@ -96,18 +137,20 @@ def load_raw_scan(npz_path: str | Path) -> RawScan:
 
 
 # ============================================================
-# Preprocessing (ORIGINAL TRAINING-COMPATIBLE VERSION)
+# Preprocessing (ORIGINAL TRAINING VERSION)
 # ============================================================
 
-def preprocess_scan_to_frame(scan: RawScan, max_range_m: float = MAX_RANGE_METERS) -> np.ndarray:
+def preprocess_scan_to_frame_original(scan: RawScan, max_range_m: float = MAX_RANGE_METERS) -> np.ndarray:
     """
     Original training-style preprocessing:
+
     - clip distances to max range
     - divide by max range
-    - invalid/no-return points become 0.0 in range channel
-    - validity mask is preserved as channel 1
+    - set invalid/no-return points to 0.0 in range channel
+    - keep validity mask as second channel
 
-    Output shape: (2, 1, 240)
+    Output shape:
+        (2, 1, 240)
     """
     if max_range_m <= 0:
         raise ValueError("max_range_m must be > 0")
@@ -116,6 +159,8 @@ def preprocess_scan_to_frame(scan: RawScan, max_range_m: float = MAX_RANGE_METER
     valid = scan.valid.astype(np.float32)
 
     range_img = np.clip(dist_m, 0.0, max_range_m) / max_range_m
+
+    # ORIGINAL behavior: invalid/no-return -> zero in range channel
     range_img[valid == 0] = 0.0
 
     x = np.stack([range_img, valid], axis=0).astype(np.float32)  # (2, 240)
@@ -148,10 +193,6 @@ class InferenceRunner:
         self.model.eval()
 
     def predict_horse_probability(self, window: np.ndarray):
-        """
-        window shape: (2, 5, 240)
-        returns: horse_prob, probs_np, pred_class
-        """
         x = np.expand_dims(window, axis=0).astype(np.float32)  # (1, 2, 5, 240)
         x_tensor = torch.from_numpy(x).to(self.device)
 
@@ -167,101 +208,10 @@ class InferenceRunner:
 
 
 # ============================================================
-# 3-scan rolling phase block processor
+# Simulated live pipeline from folder
 # ============================================================
 
-class PhaseBlockProcessor:
-    def __init__(self, model_threshold: float = MODEL_THRESHOLD):
-        self.buffer = deque(maxlen=3)
-        self.model_threshold = model_threshold
-
-    def update(self, horse_prob: float, valid_count: int, mean_valid_dist: float):
-        """
-        Returns:
-            None if block not full yet
-            otherwise dict with:
-                block_decision
-                block_horse_prob
-                block_avg_valid
-                block_avg_dist
-                block_zero_count
-        """
-        self.buffer.append(
-            {
-                "horse_prob": float(horse_prob),
-                "valid_count": int(valid_count),
-                "mean_dist": float(mean_valid_dist),
-            }
-        )
-
-        if len(self.buffer) < 3:
-            return None
-
-        horse_probs = [x["horse_prob"] for x in self.buffer]
-        valid_counts = [x["valid_count"] for x in self.buffer]
-        mean_dists = [x["mean_dist"] for x in self.buffer]
-
-        block_horse_prob = max(horse_probs)
-        block_avg_valid = float(sum(valid_counts) / 3.0)
-        block_avg_dist = float(sum(mean_dists) / 3.0)
-        block_zero_count = int(sum(1 for v in valid_counts if v == 0))
-
-        # Heuristic vetoes for obvious sparse/open/far background
-        if block_zero_count >= 2 and block_avg_valid < 25:
-            block_decision = "no_horse"
-        else:
-            block_decision = "horse_present" if block_horse_prob >= self.model_threshold else "no_horse"
-
-        return {
-            "block_decision": block_decision,
-            "block_horse_prob": block_horse_prob,
-            "block_avg_valid": block_avg_valid,
-            "block_avg_dist": block_avg_dist,
-            "block_zero_count": block_zero_count,
-        }
-
-
-# ============================================================
-# Final activation controller over block decisions
-# ============================================================
-
-class BlockActivationController:
-    def __init__(
-        self,
-        window_size: int = BLOCK_VOTE_WINDOW,
-        activate_if_at_least: int = ACTIVATE_IF_AT_LEAST,
-        deactivate_if_at_most: int = DEACTIVATE_IF_AT_MOST,
-    ):
-        self.history = deque(maxlen=window_size)
-        self.is_active = False
-        self.activate_if_at_least = activate_if_at_least
-        self.deactivate_if_at_most = deactivate_if_at_most
-
-    def update(self, block_decision: str):
-        val = 1 if block_decision == "horse_present" else 0
-        self.history.append(val)
-
-        if len(self.history) < self.history.maxlen:
-            return "HOLD", sum(self.history)
-
-        count = sum(self.history)
-
-        if (not self.is_active) and count >= self.activate_if_at_least:
-            self.is_active = True
-            return "ACTIVATE", count
-
-        if self.is_active and count <= self.deactivate_if_at_most:
-            self.is_active = False
-            return "DEACTIVATE", count
-
-        return "HOLD", count
-
-
-# ============================================================
-# Full pipeline from folder
-# ============================================================
-
-def run_full_pipeline_from_folder(
+def run_simulated_live_folder(
     scan_folder: str | Path,
     checkpoint_path: str | Path,
     delay_s: float = SIMULATED_DELAY_S,
@@ -274,38 +224,33 @@ def run_full_pipeline_from_folder(
 
     buffer = TemporalBuffer(sequence_length=SEQUENCE_LENGTH)
     inference = InferenceRunner(checkpoint_path)
-    phase_processor = PhaseBlockProcessor(model_threshold=MODEL_THRESHOLD)
-    activation_controller = BlockActivationController()
+    decision_filter = ProbabilityDecisionFilter(
+        threshold=THRESHOLD,
+        smooth_window=SMOOTH_WINDOW,
+    )
+    activation_controller = ActivationController()
 
-    print(f"\nRunning full pipeline from folder: {scan_folder}")
+    print(f"\nSimulating live run from folder: {scan_folder}")
     print(f"Total scans: {len(files)}")
     print(f"Sequence length: {SEQUENCE_LENGTH}")
-    print(f"Model threshold (inside 3-scan block): {MODEL_THRESHOLD}")
-    print(f"Activation vote window: {BLOCK_VOTE_WINDOW}")
-    print(f"Activate if >= {ACTIVATE_IF_AT_LEAST}/{BLOCK_VOTE_WINDOW}")
-    print(f"Deactivate if <= {DEACTIVATE_IF_AT_MOST}/{BLOCK_VOTE_WINDOW}")
+    print(f"Threshold: {THRESHOLD}")
+    print(f"Smoothing window: {SMOOTH_WINDOW}")
+    print(f"Activation window: {ACTIVATION_WINDOW}")
+    print(f"Activate if >= {ACTIVATE_IF_AT_LEAST}/{ACTIVATION_WINDOW}")
+    print(f"Deactivate if <= {DEACTIVATE_IF_AT_MOST}/{ACTIVATION_WINDOW}")
     print(f"Max range meters: {MAX_RANGE_METERS}")
     print("Preprocessing: ORIGINAL (invalid/no-return -> 0.0)\n")
 
     step = 0
-    num_block_decisions = 0
-    num_activate = 0
-    num_deactivate = 0
 
     for npz_path in files:
         step += 1
 
         scan = load_raw_scan(npz_path)
-        frame = preprocess_scan_to_frame(scan)
+        frame = preprocess_scan_to_frame_original(scan)
         buffer.add_frame(frame)
 
-        valid_mask = scan.valid > 0
-        valid_count = int(np.sum(valid_mask))
-
-        if np.any(valid_mask):
-            mean_valid_dist = float(np.mean(scan.dist_m[valid_mask]))
-        else:
-            mean_valid_dist = 0.0
+        valid_count = int(np.sum(scan.valid > 0))
 
         if not buffer.is_full():
             print(
@@ -319,54 +264,26 @@ def run_full_pipeline_from_folder(
 
         window = buffer.get_window()
         horse_prob, probs_np, pred_class = inference.predict_horse_probability(window)
+        result = decision_filter.update(horse_prob)
 
-        block_info = phase_processor.update(
-            horse_prob=horse_prob,
-            valid_count=valid_count,
-            mean_valid_dist=mean_valid_dist,
-        )
-
-        if block_info is None:
-            if step % PRINT_EVERY == 0:
-                print(
-                    f"step={step:04d} | file={npz_path.name} | "
-                    f"valid_count={valid_count} | "
-                    f"mean_valid_dist={mean_valid_dist:.3f} | "
-                    f"no_horse={probs_np[0]:.6f} | "
-                    f"horse_present={probs_np[1]:.6f} | "
-                    f"pred_class={pred_class} | "
-                    f"phase_block=warming"
-                )
-            if delay_s > 0:
-                time.sleep(delay_s)
-            continue
-
-        num_block_decisions += 1
-        block_decision = block_info["block_decision"]
-
-        activation_action, vote_count = activation_controller.update(block_decision)
+        activation_action, positive_count = activation_controller.update(result.decision)
 
         if activation_action == "ACTIVATE":
             activate_deterrent()
-            num_activate += 1
         elif activation_action == "DEACTIVATE":
             deactivate_deterrent()
-            num_deactivate += 1
 
         if step % PRINT_EVERY == 0:
             print(
                 f"step={step:04d} | file={npz_path.name} | "
                 f"valid_count={valid_count} | "
-                f"mean_valid_dist={mean_valid_dist:.3f} | "
                 f"no_horse={probs_np[0]:.6f} | "
                 f"horse_present={probs_np[1]:.6f} | "
+                f"raw={result.raw_probability:.6f} | "
+                f"smoothed={result.smoothed_probability:.6f} | "
+                f"decision={result.decision} | "
                 f"pred_class={pred_class} | "
-                f"block_prob={block_info['block_horse_prob']:.6f} | "
-                f"block_avg_valid={block_info['block_avg_valid']:.2f} | "
-                f"block_avg_dist={block_info['block_avg_dist']:.3f} | "
-                f"block_zero_count={block_info['block_zero_count']} | "
-                f"block_decision={block_decision} | "
-                f"votes={vote_count}/{len(activation_controller.history)} | "
+                f"activation_votes={positive_count}/{len(activation_controller.history)} | "
                 f"activation_state={'ACTIVE' if activation_controller.is_active else 'IDLE'} | "
                 f"activation_action={activation_action}"
             )
@@ -374,20 +291,13 @@ def run_full_pipeline_from_folder(
         if delay_s > 0:
             time.sleep(delay_s)
 
-    print("\n=== Summary ===")
-    print(f"Total scans processed: {step}")
-    print(f"Total block decisions made: {num_block_decisions}")
-    print(f"Final activation state: {'ACTIVE' if activation_controller.is_active else 'IDLE'}")
-    print(f"Number of ACTIVATE events: {num_activate}")
-    print(f"Number of DEACTIVATE events: {num_deactivate}")
-
 
 if __name__ == "__main__":
     # CHANGE THESE TWO PATHS
-    scan_folder = "/Users/karstenkempfe/Desktop/BearAware/live_debug_captures_outdoor"
+    scan_folder = "/Users/karstenkempfe/Desktop/BearAware/live_debug_captures_outdoor2"
     checkpoint_path = "/Users/karstenkempfe/Desktop/BearAware/bestmodel.pt"
 
-    run_full_pipeline_from_folder(
+    run_simulated_live_folder(
         scan_folder=scan_folder,
         checkpoint_path=checkpoint_path,
         delay_s=0.0,
