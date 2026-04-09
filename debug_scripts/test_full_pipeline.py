@@ -384,7 +384,7 @@ def run_full_pipeline_from_folder(
 
 if __name__ == "__main__":
     # CHANGE THESE TWO PATHS
-    scan_folder = "/Users/karstenkempfe/Desktop/BearAware/live_debug_captures_outdoor"
+    scan_folder = "/Users/karstenkempfe/Downloads/NewLidar-trainingModel/data/horses/dataset_1_Horsen"
     checkpoint_path = "/Users/karstenkempfe/Desktop/BearAware/bestmodel.pt"
 
     run_full_pipeline_from_folder(
