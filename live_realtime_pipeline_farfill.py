@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from dataclasses import dataclass
+from collections import deque
 import struct
 import socket
 import time
@@ -12,7 +13,6 @@ import torch
 
 from model import LidarBinaryCNN2D
 from test_temporal_buffer import TemporalBuffer
-from test_decision_logic import ProbabilityDecisionFilter
 
 
 # ============================================================
@@ -22,11 +22,15 @@ from test_decision_logic import ProbabilityDecisionFilter
 UDP_PORT = 2122
 SEQUENCE_LENGTH = 5
 
-# Use 0.40 for now. Your replay showed 0.30 was too low for empty windows.
-THRESHOLD = 0.40
-SMOOTH_WINDOW = 5
-PRINT_EVERY = 1
+# Phase-block model threshold
+MODEL_THRESHOLD = 0.50
 
+# Control-side activation logic
+ACTIVATION_WINDOW = 5
+ACTIVATE_IF_AT_LEAST = 3
+DEACTIVATE_IF_AT_MOST = 1
+
+PRINT_EVERY = 1
 MAX_RANGE_METERS = 40.0
 VALID_DISTANCE_THRESHOLD_M = 0.01
 
@@ -55,23 +59,121 @@ class RawScan:
 
 
 # ============================================================
+# Placeholder deterrent hooks
+# ============================================================
+
+def activate_deterrent():
+    print(">>> PLACEHOLDER: ACTIVATE DETERRENT <<<")
+
+
+def deactivate_deterrent():
+    print(">>> PLACEHOLDER: DEACTIVATE DETERRENT <<<")
+
+
+# ============================================================
+# Activation controller
+# ============================================================
+
+class ActivationController:
+    def __init__(
+        self,
+        window_size: int = ACTIVATION_WINDOW,
+        activate_if_at_least: int = ACTIVATE_IF_AT_LEAST,
+        deactivate_if_at_most: int = DEACTIVATE_IF_AT_MOST,
+    ):
+        self.window_size = window_size
+        self.activate_if_at_least = activate_if_at_least
+        self.deactivate_if_at_most = deactivate_if_at_most
+        self.history = deque(maxlen=window_size)
+        self.is_active = False
+
+    def update(self, decision: str) -> tuple[str, int]:
+        """
+        decision:
+            'horse_present' or 'no_horse'
+
+        returns:
+            action, positive_count
+
+        action:
+            'ACTIVATE'
+            'DEACTIVATE'
+            'HOLD'
+        """
+        positive = 1 if decision == "horse_present" else 0
+        self.history.append(positive)
+
+        positive_count = sum(self.history)
+
+        if len(self.history) < self.window_size:
+            return "HOLD", positive_count
+
+        if not self.is_active and positive_count >= self.activate_if_at_least:
+            self.is_active = True
+            return "ACTIVATE", positive_count
+
+        if self.is_active and positive_count <= self.deactivate_if_at_most:
+            self.is_active = False
+            return "DEACTIVATE", positive_count
+
+        return "HOLD", positive_count
+
+
+# ============================================================
+# 3-scan rolling phase block processor
+# ============================================================
+
+class PhaseBlockProcessor:
+    def __init__(self, model_threshold: float = MODEL_THRESHOLD):
+        self.buffer = deque(maxlen=3)
+        self.model_threshold = model_threshold
+
+    def update(self, horse_prob: float, valid_count: int, mean_dist: float):
+        """
+        Returns:
+            None if the 3-scan block is not full yet
+
+            Otherwise returns:
+                (
+                    decision,
+                    block_prob,
+                    avg_valid,
+                    avg_dist,
+                    zero_count,
+                )
+        """
+        self.buffer.append((horse_prob, valid_count, mean_dist))
+
+        if len(self.buffer) < 3:
+            return None
+
+        probs = [x[0] for x in self.buffer]
+        valids = [x[1] for x in self.buffer]
+        dists = [x[2] for x in self.buffer]
+
+        block_prob = max(probs)
+        avg_valid = sum(valids) / 3.0
+        avg_dist = sum(dists) / 3.0
+        zero_count = sum(1 for v in valids if v == 0)
+
+        # Single veto rule only
+        if zero_count >= 2 and avg_valid < 25:
+            decision = "no_horse"
+        else:
+            decision = "horse_present" if block_prob >= self.model_threshold else "no_horse"
+
+        return decision, block_prob, avg_valid, avg_dist, zero_count
+
+
+# ============================================================
 # Preprocessing
 # ============================================================
 
 def preprocess_scan_to_frame(scan: RawScan, max_range_m: float = MAX_RANGE_METERS) -> np.ndarray:
     """
-    Converts one raw scan into one processed frame of shape (2, 1, 240).
-
-    Channel 0:
-        normalized range values
-
-    Channel 1:
-        validity mask
-
-    IMPORTANT:
-    This version uses FARFILL:
-        for no-return points (valid == 0), range channel is set to 1.0
-        instead of 0.0
+    FARFILL version:
+    for no-return points (valid == 0), range channel is set to 1.0
+    instead of 0.0
     """
     if max_range_m <= 0:
         raise ValueError("max_range_m must be > 0")
@@ -81,7 +183,7 @@ def preprocess_scan_to_frame(scan: RawScan, max_range_m: float = MAX_RANGE_METER
 
     range_img = np.clip(dist_m, 0.0, max_range_m) / max_range_m
 
-    # FARFILL: encode no-return as max-range / far away
+    # FARFILL
     range_img[valid == 0] = 1.0
 
     x = np.stack([range_img, valid], axis=0).astype(np.float32)  # (2, 240)
@@ -200,7 +302,6 @@ def scans_from_datagram(datagram: bytes) -> list[RawScan]:
         theta_rad = theta.astype(np.float32)
         phi_rad = float(phi_arr[0])
 
-        # Current live validity rule
         valid = (dist_m > VALID_DISTANCE_THRESHOLD_M).astype(np.float32)
 
         scans_out.append(
@@ -269,17 +370,18 @@ def run_live_pipeline(checkpoint_path: str | Path):
 
     buffer = TemporalBuffer(sequence_length=SEQUENCE_LENGTH)
     inference = InferenceRunner(checkpoint_path)
-    decision_filter = ProbabilityDecisionFilter(
-        threshold=THRESHOLD,
-        smooth_window=SMOOTH_WINDOW,
-    )
+    phase_processor = PhaseBlockProcessor()
+    activation_controller = ActivationController()
 
     print(f"Listening on UDP {UDP_PORT}")
     print(f"Sequence length: {SEQUENCE_LENGTH}")
-    print(f"Threshold: {THRESHOLD}")
-    print(f"Smoothing window: {SMOOTH_WINDOW}")
+    print(f"Model threshold: {MODEL_THRESHOLD}")
+    print(f"Activation window: {ACTIVATION_WINDOW}")
+    print(f"Activate if >= {ACTIVATE_IF_AT_LEAST}/{ACTIVATION_WINDOW}")
+    print(f"Deactivate if <= {DEACTIVATE_IF_AT_MOST}/{ACTIVATION_WINDOW}")
     print(f"Max range meters: {MAX_RANGE_METERS}")
     print("Preprocessing: FARFILL enabled")
+    print("Decision logic: rolling 3-scan phase block + 5-vote activation")
     print("Waiting for live scans...\n")
 
     step = 0
@@ -294,7 +396,9 @@ def run_live_pipeline(checkpoint_path: str | Path):
             frame = preprocess_scan_to_frame(scan)
             buffer.add_frame(frame)
 
-            valid_count = int(np.sum(scan.valid > 0))
+            valid_mask = scan.valid > 0
+            valid_count = int(np.sum(valid_mask))
+            mean_dist = float(np.mean(scan.dist_m[valid_mask])) if valid_count > 0 else 0.0
 
             if not buffer.is_full():
                 print(
@@ -305,18 +409,47 @@ def run_live_pipeline(checkpoint_path: str | Path):
 
             window = buffer.get_window()
             horse_prob, probs_np, pred_class = inference.predict_horse_probability(window)
-            result = decision_filter.update(horse_prob)
+
+            block = phase_processor.update(horse_prob, valid_count, mean_dist)
+
+            if block is None:
+                if step % PRINT_EVERY == 0:
+                    print(
+                        f"step={step:04d} | "
+                        f"valid_count={valid_count} | "
+                        f"mean_dist={mean_dist:.2f} | "
+                        f"no_horse={probs_np[0]:.6f} | "
+                        f"horse_present={probs_np[1]:.6f} | "
+                        f"pred_class={pred_class} | "
+                        f"phase_block=warming"
+                    )
+                continue
+
+            decision, block_prob, avg_valid, avg_dist, zero_count = block
+
+            activation_action, positive_count = activation_controller.update(decision)
+
+            if activation_action == "ACTIVATE":
+                activate_deterrent()
+            elif activation_action == "DEACTIVATE":
+                deactivate_deterrent()
 
             if step % PRINT_EVERY == 0:
                 print(
                     f"step={step:04d} | "
                     f"valid_count={valid_count} | "
+                    f"mean_dist={mean_dist:.2f} | "
                     f"no_horse={probs_np[0]:.6f} | "
                     f"horse_present={probs_np[1]:.6f} | "
-                    f"raw={result.raw_probability:.6f} | "
-                    f"smoothed={result.smoothed_probability:.6f} | "
-                    f"decision={result.decision} | "
-                    f"pred_class={pred_class}"
+                    f"pred_class={pred_class} | "
+                    f"block_prob={block_prob:.6f} | "
+                    f"block_avg_valid={avg_valid:.2f} | "
+                    f"block_avg_dist={avg_dist:.2f} | "
+                    f"block_zero_count={zero_count} | "
+                    f"block_decision={decision} | "
+                    f"votes={positive_count}/{len(activation_controller.history)} | "
+                    f"activation_state={'ACTIVE' if activation_controller.is_active else 'IDLE'} | "
+                    f"activation_action={activation_action}"
                 )
 
 
