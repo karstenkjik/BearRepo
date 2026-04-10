@@ -454,6 +454,16 @@ class InferenceRunner:
 # Main live pipeline
 # ============================================================
 
+def select_high_valid_scan(scans: list[RawScan]) -> RawScan | None:
+    """
+    From one UDP datagram's worth of scans, keep only the scan with the
+    highest valid_count. If scans is empty, return None.
+    """
+    if not scans:
+        return None
+
+    return max(scans, key=lambda scan: int(np.sum(scan.valid > 0)))
+
 def run_live_pipeline(checkpoint_path: str | Path):
     global DETERRENT
 
@@ -479,6 +489,7 @@ def run_live_pipeline(checkpoint_path: str | Path):
     print(f"Deterrent ultrasonic GPIO: {ULTRASONIC_GPIO}")
     print(f"Deterrent LED GPIO: {LED_GPIO}")
     print("Preprocessing: FARFILL enabled")
+    print("Scan selection: highest-valid-count scan only from each UDP chunk")
     print("Decision logic: rolling 3-scan phase block + 5-vote activation")
     print("Waiting for live scans...\n")
 
@@ -489,67 +500,79 @@ def run_live_pipeline(checkpoint_path: str | Path):
             datagram, addr = sock.recvfrom(65535)
             scans = scans_from_datagram(datagram)
 
-            for scan in scans:
-                step += 1
+            if not scans:
+                continue
 
-                frame = preprocess_scan_to_frame(scan)
-                buffer.add_frame(frame)
+            valid_counts_all = [int(np.sum(scan.valid > 0)) for scan in scans]
+            selected_scan = select_high_valid_scan(scans)
 
-                valid_mask = scan.valid > 0
-                valid_count = int(np.sum(valid_mask))
-                mean_dist = float(np.mean(scan.dist_m[valid_mask])) if valid_count > 0 else 0.0
+            if selected_scan is None:
+                continue
 
-                if not buffer.is_full():
-                    print(
-                        f"step={step:04d} | buffering ({len(buffer.buffer)}/{SEQUENCE_LENGTH}) | "
-                        f"valid_count={valid_count}"
-                    )
-                    continue
+            step += 1
 
-                window = buffer.get_window()
-                horse_prob, probs_np, pred_class = inference.predict_horse_probability(window)
+            frame = preprocess_scan_to_frame(selected_scan)
+            buffer.add_frame(frame)
 
-                block = phase_processor.update(horse_prob, valid_count, mean_dist)
+            valid_mask = selected_scan.valid > 0
+            valid_count = int(np.sum(valid_mask))
+            mean_dist = float(np.mean(selected_scan.dist_m[valid_mask])) if valid_count > 0 else 0.0
 
-                if block is None:
-                    if step % PRINT_EVERY == 0:
-                        print(
-                            f"step={step:04d} | "
-                            f"valid_count={valid_count} | "
-                            f"mean_dist={mean_dist:.2f} | "
-                            f"no_horse={probs_np[0]:.6f} | "
-                            f"horse_present={probs_np[1]:.6f} | "
-                            f"pred_class={pred_class} | "
-                            f"phase_block=warming"
-                        )
-                    continue
+            if not buffer.is_full():
+                print(
+                    f"step={step:04d} | "
+                    f"chunk_valid_counts={valid_counts_all} | "
+                    f"selected_valid_count={valid_count} | "
+                    f"buffering ({len(buffer.buffer)}/{SEQUENCE_LENGTH})"
+                )
+                continue
 
-                decision, block_prob, avg_valid, avg_dist, zero_count = block
+            window = buffer.get_window()
+            horse_prob, probs_np, pred_class = inference.predict_horse_probability(window)
 
-                activation_action, positive_count = activation_controller.update(decision)
+            block = phase_processor.update(horse_prob, valid_count, mean_dist)
 
-                if activation_action == "ACTIVATE":
-                    activate_deterrent()
-                elif activation_action == "DEACTIVATE":
-                    deactivate_deterrent()
-
+            if block is None:
                 if step % PRINT_EVERY == 0:
                     print(
                         f"step={step:04d} | "
-                        f"valid_count={valid_count} | "
+                        f"chunk_valid_counts={valid_counts_all} | "
+                        f"selected_valid_count={valid_count} | "
                         f"mean_dist={mean_dist:.2f} | "
                         f"no_horse={probs_np[0]:.6f} | "
                         f"horse_present={probs_np[1]:.6f} | "
                         f"pred_class={pred_class} | "
-                        f"block_prob={block_prob:.6f} | "
-                        f"block_avg_valid={avg_valid:.2f} | "
-                        f"block_avg_dist={avg_dist:.2f} | "
-                        f"block_zero_count={zero_count} | "
-                        f"block_decision={decision} | "
-                        f"votes={positive_count}/{len(activation_controller.history)} | "
-                        f"activation_state={'ACTIVE' if activation_controller.is_active else 'IDLE'} | "
-                        f"activation_action={activation_action}"
+                        f"phase_block=warming"
                     )
+                continue
+
+            decision, block_prob, avg_valid, avg_dist, zero_count = block
+
+            activation_action, positive_count = activation_controller.update(decision)
+
+            if activation_action == "ACTIVATE":
+                activate_deterrent()
+            elif activation_action == "DEACTIVATE":
+                deactivate_deterrent()
+
+            if step % PRINT_EVERY == 0:
+                print(
+                    f"step={step:04d} | "
+                    f"chunk_valid_counts={valid_counts_all} | "
+                    f"selected_valid_count={valid_count} | "
+                    f"mean_dist={mean_dist:.2f} | "
+                    f"no_horse={probs_np[0]:.6f} | "
+                    f"horse_present={probs_np[1]:.6f} | "
+                    f"pred_class={pred_class} | "
+                    f"block_prob={block_prob:.6f} | "
+                    f"block_avg_valid={avg_valid:.2f} | "
+                    f"block_avg_dist={avg_dist:.2f} | "
+                    f"block_zero_count={zero_count} | "
+                    f"block_decision={decision} | "
+                    f"votes={positive_count}/{len(activation_controller.history)} | "
+                    f"activation_state={'ACTIVE' if activation_controller.is_active else 'IDLE'} | "
+                    f"activation_action={activation_action}"
+                )
 
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt received, shutting down cleanly...")
