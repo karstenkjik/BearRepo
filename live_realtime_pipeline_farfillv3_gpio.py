@@ -454,15 +454,8 @@ class InferenceRunner:
 # Main live pipeline
 # ============================================================
 
-def select_high_valid_scan(scans: list[RawScan]) -> RawScan | None:
-    """
-    From one UDP datagram's worth of scans, keep only the scan with the
-    highest valid_count. If scans is empty, return None.
-    """
-    if not scans:
-        return None
-
-    return max(scans, key=lambda scan: int(np.sum(scan.valid > 0)))
+def valid_count_of_scan(scan: RawScan) -> int:
+    return int(np.sum(scan.valid > 0))
 
 def run_live_pipeline(checkpoint_path: str | Path):
     global DETERRENT
@@ -479,6 +472,9 @@ def run_live_pipeline(checkpoint_path: str | Path):
     phase_processor = PhaseBlockProcessor()
     activation_controller = ActivationController()
 
+    # This stores the repeating 3-scan pattern before selecting the best one
+    incoming_triplet: list[RawScan] = []
+
     print(f"Listening on UDP {UDP_PORT}")
     print(f"Sequence length: {SEQUENCE_LENGTH}")
     print(f"Model threshold: {MODEL_THRESHOLD}")
@@ -489,90 +485,115 @@ def run_live_pipeline(checkpoint_path: str | Path):
     print(f"Deterrent ultrasonic GPIO: {ULTRASONIC_GPIO}")
     print(f"Deterrent LED GPIO: {LED_GPIO}")
     print("Preprocessing: FARFILL enabled")
-    print("Scan selection: highest-valid-count scan only from each UDP chunk")
+    print("Scan selection: for each consecutive group of 3 scans, only the highest-valid-count scan is used")
     print("Decision logic: rolling 3-scan phase block + 5-vote activation")
     print("Waiting for live scans...\n")
 
-    step = 0
+    raw_step = 0
+    selected_step = 0
 
     try:
         while True:
             datagram, addr = sock.recvfrom(65535)
             scans = scans_from_datagram(datagram)
 
-            if not scans:
-                continue
+            for scan in scans:
+                raw_step += 1
+                incoming_triplet.append(scan)
 
-            valid_counts_all = [int(np.sum(scan.valid > 0)) for scan in scans]
-            selected_scan = select_high_valid_scan(scans)
-
-            if selected_scan is None:
-                continue
-
-            step += 1
-
-            frame = preprocess_scan_to_frame(selected_scan)
-            buffer.add_frame(frame)
-
-            valid_mask = selected_scan.valid > 0
-            valid_count = int(np.sum(valid_mask))
-            mean_dist = float(np.mean(selected_scan.dist_m[valid_mask])) if valid_count > 0 else 0.0
-
-            if not buffer.is_full():
-                print(
-                    f"step={step:04d} | "
-                    f"chunk_valid_counts={valid_counts_all} | "
-                    f"selected_valid_count={valid_count} | "
-                    f"buffering ({len(buffer.buffer)}/{SEQUENCE_LENGTH})"
+                raw_valid_count = valid_count_of_scan(scan)
+                raw_valid_mask = scan.valid > 0
+                raw_mean_dist = (
+                    float(np.mean(scan.dist_m[raw_valid_mask]))
+                    if raw_valid_count > 0 else 0.0
                 )
-                continue
 
-            window = buffer.get_window()
-            horse_prob, probs_np, pred_class = inference.predict_horse_probability(window)
+                print(
+                    f"raw_step={raw_step:04d} | "
+                    f"triplet_fill={len(incoming_triplet)}/3 | "
+                    f"valid_count={raw_valid_count} | "
+                    f"mean_dist={raw_mean_dist:.2f}"
+                )
 
-            block = phase_processor.update(horse_prob, valid_count, mean_dist)
+                # Wait until we have the full 3-scan pattern
+                if len(incoming_triplet) < 3:
+                    continue
 
-            if block is None:
-                if step % PRINT_EVERY == 0:
+                # Select the scan with the highest valid_count from this group of 3
+                triplet_valid_counts = [valid_count_of_scan(s) for s in incoming_triplet]
+                best_idx = int(np.argmax(triplet_valid_counts))
+                selected_scan = incoming_triplet[best_idx]
+
+                # Reset for the next 3-scan cycle
+                incoming_triplet.clear()
+
+                selected_step += 1
+
+                valid_mask = selected_scan.valid > 0
+                valid_count = int(np.sum(valid_mask))
+                mean_dist = float(np.mean(selected_scan.dist_m[valid_mask])) if valid_count > 0 else 0.0
+
+                frame = preprocess_scan_to_frame(selected_scan)
+                buffer.add_frame(frame)
+
+                if not buffer.is_full():
                     print(
-                        f"step={step:04d} | "
-                        f"chunk_valid_counts={valid_counts_all} | "
+                        f"selected_step={selected_step:04d} | "
+                        f"triplet_valid_counts={triplet_valid_counts} | "
+                        f"chosen_index={best_idx} | "
+                        f"selected_valid_count={valid_count} | "
+                        f"buffering ({len(buffer.buffer)}/{SEQUENCE_LENGTH})"
+                    )
+                    continue
+
+                window = buffer.get_window()
+                horse_prob, probs_np, pred_class = inference.predict_horse_probability(window)
+
+                block = phase_processor.update(horse_prob, valid_count, mean_dist)
+
+                if block is None:
+                    if selected_step % PRINT_EVERY == 0:
+                        print(
+                            f"selected_step={selected_step:04d} | "
+                            f"triplet_valid_counts={triplet_valid_counts} | "
+                            f"chosen_index={best_idx} | "
+                            f"selected_valid_count={valid_count} | "
+                            f"mean_dist={mean_dist:.2f} | "
+                            f"no_horse={probs_np[0]:.6f} | "
+                            f"horse_present={probs_np[1]:.6f} | "
+                            f"pred_class={pred_class} | "
+                            f"phase_block=warming"
+                        )
+                    continue
+
+                decision, block_prob, avg_valid, avg_dist, zero_count = block
+
+                activation_action, positive_count = activation_controller.update(decision)
+
+                if activation_action == "ACTIVATE":
+                    activate_deterrent()
+                elif activation_action == "DEACTIVATE":
+                    deactivate_deterrent()
+
+                if selected_step % PRINT_EVERY == 0:
+                    print(
+                        f"selected_step={selected_step:04d} | "
+                        f"triplet_valid_counts={triplet_valid_counts} | "
+                        f"chosen_index={best_idx} | "
                         f"selected_valid_count={valid_count} | "
                         f"mean_dist={mean_dist:.2f} | "
                         f"no_horse={probs_np[0]:.6f} | "
                         f"horse_present={probs_np[1]:.6f} | "
                         f"pred_class={pred_class} | "
-                        f"phase_block=warming"
+                        f"block_prob={block_prob:.6f} | "
+                        f"block_avg_valid={avg_valid:.2f} | "
+                        f"block_avg_dist={avg_dist:.2f} | "
+                        f"block_zero_count={zero_count} | "
+                        f"block_decision={decision} | "
+                        f"votes={positive_count}/{len(activation_controller.history)} | "
+                        f"activation_state={'ACTIVE' if activation_controller.is_active else 'IDLE'} | "
+                        f"activation_action={activation_action}"
                     )
-                continue
-
-            decision, block_prob, avg_valid, avg_dist, zero_count = block
-
-            activation_action, positive_count = activation_controller.update(decision)
-
-            if activation_action == "ACTIVATE":
-                activate_deterrent()
-            elif activation_action == "DEACTIVATE":
-                deactivate_deterrent()
-
-            if step % PRINT_EVERY == 0:
-                print(
-                    f"step={step:04d} | "
-                    f"chunk_valid_counts={valid_counts_all} | "
-                    f"selected_valid_count={valid_count} | "
-                    f"mean_dist={mean_dist:.2f} | "
-                    f"no_horse={probs_np[0]:.6f} | "
-                    f"horse_present={probs_np[1]:.6f} | "
-                    f"pred_class={pred_class} | "
-                    f"block_prob={block_prob:.6f} | "
-                    f"block_avg_valid={avg_valid:.2f} | "
-                    f"block_avg_dist={avg_dist:.2f} | "
-                    f"block_zero_count={zero_count} | "
-                    f"block_decision={decision} | "
-                    f"votes={positive_count}/{len(activation_controller.history)} | "
-                    f"activation_state={'ACTIVE' if activation_controller.is_active else 'IDLE'} | "
-                    f"activation_action={activation_action}"
-                )
 
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt received, shutting down cleanly...")
