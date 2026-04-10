@@ -6,13 +6,10 @@ from collections import deque
 import struct
 import socket
 import time
-import atexit
 
 import msgpack
 import numpy as np
 import torch
-import pigpio
-from gpiozero import PWMOutputDevice
 
 from model import LidarBinaryCNN2D
 from test_temporal_buffer import TemporalBuffer
@@ -26,25 +23,17 @@ UDP_PORT = 2122
 SEQUENCE_LENGTH = 5
 
 # Phase-block model threshold
-MODEL_THRESHOLD = 0.4
+MODEL_THRESHOLD = 0.45
 
 # Control-side activation logic
 ACTIVATION_WINDOW = 5
-ACTIVATE_IF_AT_LEAST = 2
+ACTIVATE_IF_AT_LEAST = 3
 DEACTIVATE_IF_AT_MOST = 0
+FARFILL_VALUE = 0.9
 
 PRINT_EVERY = 1
 MAX_RANGE_METERS = 40.0
 VALID_DISTANCE_THRESHOLD_M = 0.01
-
-# Deterrent / GPIO config
-ULTRASONIC_GPIO = 18
-ULTRASONIC_FREQ = 8000
-ULTRASONIC_DUTY = 500000  # pigpio hardware_PWM duty range: 0..1_000_000
-
-LED_GPIO = 12
-LED_FREQ = 1
-LED_DUTY = 0.5
 
 
 # Tokenized msgpack keys used by the SICK datagrams
@@ -71,92 +60,15 @@ class RawScan:
 
 
 # ============================================================
-# GPIO deterrent controller
+# Placeholder deterrent hooks
 # ============================================================
 
-class DeterrentController:
-    def __init__(self):
-        self.pi = pigpio.pi()
-        if not self.pi.connected:
-            raise RuntimeError(
-                "Failed to connect to pigpio daemon. Make sure pigpiod is running."
-            )
-
-        self.led_pwm: PWMOutputDevice | None = None
-        self.is_active = False
-
-    def activate(self):
-        if self.is_active:
-            return
-
-        # Ultrasonic output
-        self.pi.hardware_PWM(ULTRASONIC_GPIO, ULTRASONIC_FREQ, ULTRASONIC_DUTY)
-
-        # LED output
-        self.led_pwm = PWMOutputDevice(LED_GPIO)
-        self.led_pwm.frequency = LED_FREQ
-        self.led_pwm.value = LED_DUTY
-
-        self.is_active = True
-        print(">>> DETERRENT ACTIVATED <<<")
-
-    def deactivate(self):
-        if not self.is_active:
-            return
-
-        # Stop ultrasonic PWM
-        self.pi.hardware_PWM(ULTRASONIC_GPIO, 0, 0)
-
-        # Stop LED PWM
-        if self.led_pwm is not None:
-            self.led_pwm.close()
-            self.led_pwm = None
-
-        self.is_active = False
-        print(">>> DETERRENT DEACTIVATED <<<")
-
-    def cleanup(self):
-        try:
-            self.deactivate()
-        finally:
-            if self.pi is not None:
-                self.pi.stop()
-
-
-def startup_led_sequence(controller: DeterrentController, flashes: int = 3, delay: float = 0.3):
-    print(">>> Running startup LED sequence <<<")
-
-    led = PWMOutputDevice(LED_GPIO)
-    led.frequency = LED_FREQ
-
-    for _ in range(flashes):
-        led.value = LED_DUTY
-        time.sleep(delay)
-        led.value = 0
-        time.sleep(delay)
-
-    led.close()
-
-
-# Global deterrent handle so hooks can access it
-DETERRENT: DeterrentController | None = None
-
 def activate_deterrent():
-    global DETERRENT
-    if DETERRENT is not None:
-        DETERRENT.activate()
+    print(">>> PLACEHOLDER: ACTIVATE DETERRENT <<<")
 
 
 def deactivate_deterrent():
-    global DETERRENT
-    if DETERRENT is not None:
-        DETERRENT.deactivate()
-
-
-def cleanup_deterrent():
-    global DETERRENT
-    if DETERRENT is not None:
-        DETERRENT.cleanup()
+    print(">>> PLACEHOLDER: DEACTIVATE DETERRENT <<<")
 
 
 # ============================================================
@@ -178,13 +90,13 @@ class ActivationController:
 
     def update(self, decision: str) -> tuple[str, int]:
         """
-        decision should be:
+        decision:
             'horse_present' or 'no_horse'
 
         returns:
             action, positive_count
 
-        action is one of:
+        action:
             'ACTIVATE'
             'DEACTIVATE'
             'HOLD'
@@ -246,11 +158,10 @@ class PhaseBlockProcessor:
         zero_count = sum(1 for v in valids if v == 0)
 
         # Single veto rule only
-        # if zero_count >= 2 and avg_valid > 25:
-            #decision = "no_horse"
-        #else:
-            
-        decision = "horse_present" if block_prob >= self.model_threshold else "no_horse"
+        if zero_count >= 2 and avg_valid < 20:
+            decision = "no_horse"
+        else:
+            decision = "horse_present" if block_prob >= self.model_threshold else "no_horse"
 
         return decision, block_prob, avg_valid, avg_dist, zero_count
 
@@ -261,8 +172,9 @@ class PhaseBlockProcessor:
 
 def preprocess_scan_to_frame(scan: RawScan, max_range_m: float = MAX_RANGE_METERS) -> np.ndarray:
     """
-    ORIGINAL preprocessing (training-compatible):
-    invalid/no-return points become 0.0 in the range channel.
+    FARFILL version:
+    for no-return points (valid == 0), range channel is set to 1.0
+    instead of 0.0
     """
     if max_range_m <= 0:
         raise ValueError("max_range_m must be > 0")
@@ -271,7 +183,9 @@ def preprocess_scan_to_frame(scan: RawScan, max_range_m: float = MAX_RANGE_METER
     valid = scan.valid.astype(np.float32)
 
     range_img = np.clip(dist_m, 0.0, max_range_m) / max_range_m
-    range_img[valid == 0] = 0.0
+
+    # FARFILL
+    range_img[valid == 0] = FARFILL_VALUE
 
     x = np.stack([range_img, valid], axis=0).astype(np.float32)  # (2, 240)
     x = np.expand_dims(x, axis=1)                                # (2, 1, 240)
@@ -316,6 +230,10 @@ def decode_sick_array(arr_obj):
 
 
 def parse_stx_framed_msgpack(datagram: bytes):
+    """
+    Expected format:
+      [0x02 0x02 0x02 0x02][u32 payload_len LE][payload][u32 crc LE]
+    """
     if len(datagram) < 12 or datagram[:4] != b"\x02\x02\x02\x02":
         return None
 
@@ -343,6 +261,9 @@ def extract_segment_data(msg: dict):
 
 
 def scans_from_datagram(datagram: bytes) -> list[RawScan]:
+    """
+    Parse one UDP datagram into zero or more RawScan objects.
+    """
     try:
         msg = parse_stx_framed_msgpack(datagram)
     except Exception:
@@ -422,6 +343,10 @@ class InferenceRunner:
         self.model.eval()
 
     def predict_horse_probability(self, window: np.ndarray):
+        """
+        window shape: (2, 5, 240)
+        returns: horse_prob, probs_np, pred_class
+        """
         x = np.expand_dims(window, axis=0).astype(np.float32)  # (1, 2, 5, 240)
         x_tensor = torch.from_numpy(x).to(self.device)
 
@@ -441,12 +366,6 @@ class InferenceRunner:
 # ============================================================
 
 def run_live_pipeline(checkpoint_path: str | Path):
-    global DETERRENT
-
-    DETERRENT = DeterrentController()
-    startup_led_sequence(DETERRENT)
-    atexit.register(cleanup_deterrent)
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", UDP_PORT))
 
@@ -462,63 +381,39 @@ def run_live_pipeline(checkpoint_path: str | Path):
     print(f"Activate if >= {ACTIVATE_IF_AT_LEAST}/{ACTIVATION_WINDOW}")
     print(f"Deactivate if <= {DEACTIVATE_IF_AT_MOST}/{ACTIVATION_WINDOW}")
     print(f"Max range meters: {MAX_RANGE_METERS}")
-    print(f"Deterrent ultrasonic GPIO: {ULTRASONIC_GPIO}")
-    print(f"Deterrent LED GPIO: {LED_GPIO}")
-    print("Preprocessing: ORIGINAL")
+    print("Preprocessing: FARFILL enabled")
     print("Decision logic: rolling 3-scan phase block + 5-vote activation")
     print("Waiting for live scans...\n")
 
     step = 0
 
-    try:
-        while True:
-            datagram, addr = sock.recvfrom(65535)
-            scans = scans_from_datagram(datagram)
+    while True:
+        datagram, addr = sock.recvfrom(65535)
+        scans = scans_from_datagram(datagram)
 
-            for scan in scans:
-                step += 1
+        for scan in scans:
+            step += 1
 
-                frame = preprocess_scan_to_frame(scan)
-                buffer.add_frame(frame)
+            frame = preprocess_scan_to_frame(scan)
+            buffer.add_frame(frame)
 
-                valid_mask = scan.valid > 0
-                valid_count = int(np.sum(valid_mask))
-                mean_dist = float(np.mean(scan.dist_m[valid_mask])) if valid_count > 0 else 0.0
+            valid_mask = scan.valid > 0
+            valid_count = int(np.sum(valid_mask))
+            mean_dist = float(np.mean(scan.dist_m[valid_mask])) if valid_count > 0 else 0.0
 
-                if not buffer.is_full():
-                    print(
-                        f"step={step:04d} | buffering ({len(buffer.buffer)}/{SEQUENCE_LENGTH}) | "
-                        f"valid_count={valid_count}"
-                    )
-                    continue
+            if not buffer.is_full():
+                print(
+                    f"step={step:04d} | buffering ({len(buffer.buffer)}/{SEQUENCE_LENGTH}) | "
+                    f"valid_count={valid_count}"
+                )
+                continue
 
-                window = buffer.get_window()
-                horse_prob, probs_np, pred_class = inference.predict_horse_probability(window)
+            window = buffer.get_window()
+            horse_prob, probs_np, pred_class = inference.predict_horse_probability(window)
 
-                block = phase_processor.update(horse_prob, valid_count, mean_dist)
+            block = phase_processor.update(horse_prob, valid_count, mean_dist)
 
-                if block is None:
-                    if step % PRINT_EVERY == 0:
-                        print(
-                            f"step={step:04d} | "
-                            f"valid_count={valid_count} | "
-                            f"mean_dist={mean_dist:.2f} | "
-                            f"no_horse={probs_np[0]:.6f} | "
-                            f"horse_present={probs_np[1]:.6f} | "
-                            f"pred_class={pred_class} | "
-                            f"phase_block=warming"
-                        )
-                    continue
-
-                decision, block_prob, avg_valid, avg_dist, zero_count = block
-
-                activation_action, positive_count = activation_controller.update(decision)
-
-                if activation_action == "ACTIVATE":
-                    activate_deterrent()
-                elif activation_action == "DEACTIVATE":
-                    deactivate_deterrent()
-
+            if block is None:
                 if step % PRINT_EVERY == 0:
                     print(
                         f"step={step:04d} | "
@@ -527,28 +422,36 @@ def run_live_pipeline(checkpoint_path: str | Path):
                         f"no_horse={probs_np[0]:.6f} | "
                         f"horse_present={probs_np[1]:.6f} | "
                         f"pred_class={pred_class} | "
-                        f"block_prob={block_prob:.6f} | "
-                        f"block_avg_valid={avg_valid:.2f} | "
-                        f"block_avg_dist={avg_dist:.2f} | "
-                        f"block_zero_count={zero_count} | "
-                        f"block_decision={decision} | "
-                        f"votes={positive_count}/{len(activation_controller.history)} | "
-                        f"activation_state={'ACTIVE' if activation_controller.is_active else 'IDLE'} | "
-                        f"activation_action={activation_action}"
+                        f"phase_block=warming"
                     )
+                continue
 
-    except KeyboardInterrupt:
-        print("\nKeyboardInterrupt received, shutting down cleanly...")
-    finally:
-        try:
-            deactivate_deterrent()
-        except Exception:
-            pass
-        try:
-            sock.close()
-        except Exception:
-            pass
-        cleanup_deterrent()
+            decision, block_prob, avg_valid, avg_dist, zero_count = block
+
+            activation_action, positive_count = activation_controller.update(decision)
+
+            if activation_action == "ACTIVATE":
+                activate_deterrent()
+            elif activation_action == "DEACTIVATE":
+                deactivate_deterrent()
+
+            if step % PRINT_EVERY == 0:
+                print(
+                    f"step={step:04d} | "
+                    f"valid_count={valid_count} | "
+                    f"mean_dist={mean_dist:.2f} | "
+                    f"no_horse={probs_np[0]:.6f} | "
+                    f"horse_present={probs_np[1]:.6f} | "
+                    f"pred_class={pred_class} | "
+                    f"block_prob={block_prob:.6f} | "
+                    f"block_avg_valid={avg_valid:.2f} | "
+                    f"block_avg_dist={avg_dist:.2f} | "
+                    f"block_zero_count={zero_count} | "
+                    f"block_decision={decision} | "
+                    f"votes={positive_count}/{len(activation_controller.history)} | "
+                    f"activation_state={'ACTIVE' if activation_controller.is_active else 'IDLE'} | "
+                    f"activation_action={activation_action}"
+                )
 
 
 if __name__ == "__main__":
